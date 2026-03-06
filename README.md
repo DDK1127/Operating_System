@@ -13,3 +13,6 @@ Linux Scheduling Policy
 
 ## Lab3 : System Information Fetching Kernel Module
 **implement a kernel module that fetches the system information from the kernel**.
+
+
+#### [my notes & lab reports](https://hackmd.io/gePgauHuSjy5YaGP8Khzyw)
