@@ -1,0 +1,132 @@
+From 602d8ce53fb5bcf41ee83dde0309a179261b00e3 Mon Sep 17 00:00:00 2001
+From: ddk1127 <derek61003@gmail.com>
+Date: Sat, 4 Oct 2025 19:11:35 +0000
+Subject: [PATCH 1/2] Add revstr syscall
+
+---
+ Makefile                             |  1 +
+ arch/riscv/include/uapi/asm/unistd.h |  5 ++++
+ include/linux/syscalls.h             |  3 ++
+ include/uapi/asm-generic/unistd.h    |  5 +++-
+ kernel/Makefile                      |  1 +
+ kernel/revstr_syscall.c              | 43 ++++++++++++++++++++++++++++
+ 6 files changed, 57 insertions(+), 1 deletion(-)
+ create mode 100644 kernel/revstr_syscall.c
+
+diff --git a/Makefile b/Makefile
+index 997b67722..549ea6be3 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2120,3 +2120,4 @@ FORCE:
+ # Declare the contents of the PHONY variable as phony.  We keep that
+ # information in a variable so we can use it in if_changed and friends.
+ .PHONY: $(PHONY)
++
+diff --git a/arch/riscv/include/uapi/asm/unistd.h b/arch/riscv/include/uapi/asm/unistd.h
+index 73d7cdd2e..b41787265 100644
+--- a/arch/riscv/include/uapi/asm/unistd.h
++++ b/arch/riscv/include/uapi/asm/unistd.h
+@@ -43,3 +43,8 @@
+ #define __NR_riscv_flush_icache (__NR_arch_specific_syscall + 15)
+ #endif
+ __SYSCALL(__NR_riscv_flush_icache, sys_riscv_flush_icache)
++
++/* i add it */
++#define __NR_revstr 451
++__SYSCALL(__NR_revstr, sys_revstr)
++
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index a34b0f9a9..40e563f53 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1276,6 +1276,9 @@ asmlinkage long sys_old_mmap(struct mmap_arg_struct __user *arg);
+  */
+ asmlinkage long sys_ni_syscall(void);
+ 
++/* my assignment: revstr_syscall.c */
++asmlinkage long sys_revstr(char __user *str, size_t n);
++
+ #endif /* CONFIG_ARCH_HAS_SYSCALL_WRAPPER */
+ 
+ 
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 45fa180cc..cd92d7ebd 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -886,8 +886,11 @@ __SYSCALL(__NR_futex_waitv, sys_futex_waitv)
+ #define __NR_set_mempolicy_home_node 450
+ __SYSCALL(__NR_set_mempolicy_home_node, sys_set_mempolicy_home_node)
+ 
++#define __NR_revstr 451
++__SYSCALL(__NR_revstr, sys_revstr)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 451
++#define __NR_syscalls 452
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/kernel/Makefile b/kernel/Makefile
+index d754e0be1..d69238ec2 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -53,6 +53,7 @@ obj-y += rcu/
+ obj-y += livepatch/
+ obj-y += dma/
+ obj-y += entry/
++obj-y += revstr_syscall.o
+ obj-$(CONFIG_MODULES) += module/
+ 
+ obj-$(CONFIG_KCMP) += kcmp.o
+diff --git a/kernel/revstr_syscall.c b/kernel/revstr_syscall.c
+new file mode 100644
+index 000000000..c37c03415
+--- /dev/null
++++ b/kernel/revstr_syscall.c
+@@ -0,0 +1,43 @@
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <linux/uaccess.h>
++#include <linux/slab.h>
++
++SYSCALL_DEFINE2(revstr, char __user *, str, size_t, n)
++{
++  char *kbuf, *revbuf;
++  size_t i;
++
++  kbuf = kmalloc(n + 1, GFP_KERNEL);
++  if(!kbuf) return -ENOMEM;
++
++  revbuf = kmalloc(n + 1, GFP_KERNEL);
++  if(!revbuf) { kfree(kbuf); return -ENOMEM; }
++
++  if(copy_from_user(kbuf, str, n)){
++    kfree(kbuf);
++    kfree(revbuf);
++    return -EFAULT;
++  }
++
++  kbuf[n] = '\0';
++ 
++  pr_info("The origin string = %s\n", kbuf);
++
++  for(i = 0; i < n; i++)
++      revbuf[i] = kbuf[n - i - 1];
++  revbuf[n] = '\0';
++
++  pr_info("The reversed string = %s\n", revbuf);
++
++  if(copy_to_user(str, revbuf, n + 1)){
++    kfree(kbuf);
++    kfree(revbuf);
++    return -EFAULT;
++  }
++
++  kfree(kbuf);
++  kfree(revbuf);
++  return 0;
++
++}
+-- 
+2.43.0
+

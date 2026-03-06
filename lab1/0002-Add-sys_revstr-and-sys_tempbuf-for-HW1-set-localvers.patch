@@ -1,0 +1,332 @@
+From 0fad0041dff3e4c95ef139fe570054eb78745ab2 Mon Sep 17 00:00:00 2001
+From: ddk1127 <derek61003@gmail.com>
+Date: Mon, 13 Oct 2025 08:48:36 +0000
+Subject: [PATCH 2/2] Add sys_revstr and sys_tempbuf for HW1; set localversion
+
+---
+ arch/riscv/include/uapi/asm/unistd.h |   9 +-
+ include/linux/syscalls.h             |   3 +-
+ include/uapi/asm-generic/unistd.h    |   5 +-
+ kernel/Makefile                      |   2 +
+ kernel/tempbuf_syscall.c             | 243 +++++++++++++++++++++++++++
+ 5 files changed, 259 insertions(+), 3 deletions(-)
+ create mode 100644 kernel/tempbuf_syscall.c
+
+diff --git a/arch/riscv/include/uapi/asm/unistd.h b/arch/riscv/include/uapi/asm/unistd.h
+index b41787265..e24bc51a3 100644
+--- a/arch/riscv/include/uapi/asm/unistd.h
++++ b/arch/riscv/include/uapi/asm/unistd.h
+@@ -44,7 +44,14 @@
+ #endif
+ __SYSCALL(__NR_riscv_flush_icache, sys_riscv_flush_icache)
+ 
+-/* i add it */
++/* --- custom syscalls for assignment --- */
+ #define __NR_revstr 451
++#define __NR_tempbuf 452
++
+ __SYSCALL(__NR_revstr, sys_revstr)
++__SYSCALL(__NR_tempbuf, sys_tempbuf)
++
++/* --- adjust the table length(the last number + 1) --- */
++#undef  __NR_syscalls
++#define __NR_syscalls 453
+ 
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 40e563f53..feaf80b92 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1276,8 +1276,9 @@ asmlinkage long sys_old_mmap(struct mmap_arg_struct __user *arg);
+  */
+ asmlinkage long sys_ni_syscall(void);
+ 
+-/* my assignment: revstr_syscall.c */
++/* my assignment, custom syscall */
+ asmlinkage long sys_revstr(char __user *str, size_t n);
++asmlinkage long sys_tempbuf(int mode, void __user *data, size_t size);
+ 
+ #endif /* CONFIG_ARCH_HAS_SYSCALL_WRAPPER */
+ 
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index cd92d7ebd..7e9da4eda 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -889,8 +889,11 @@ __SYSCALL(__NR_set_mempolicy_home_node, sys_set_mempolicy_home_node)
+ #define __NR_revstr 451
+ __SYSCALL(__NR_revstr, sys_revstr)
+ 
++#define __NR_tempbuf 452
++__SYSCALL(__NR_tempbuf, sys_tempbuf)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 452
++#define __NR_syscalls 453
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/kernel/Makefile b/kernel/Makefile
+index d69238ec2..3c3f79e6d 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -53,7 +53,9 @@ obj-y += rcu/
+ obj-y += livepatch/
+ obj-y += dma/
+ obj-y += entry/
++# Assigment, add new syscalls
+ obj-y += revstr_syscall.o
++obj-y += tempbuf_syscall.o
+ obj-$(CONFIG_MODULES) += module/
+ 
+ obj-$(CONFIG_KCMP) += kcmp.o
+diff --git a/kernel/tempbuf_syscall.c b/kernel/tempbuf_syscall.c
+new file mode 100644
+index 000000000..cd1544f3a
+--- /dev/null
++++ b/kernel/tempbuf_syscall.c
+@@ -0,0 +1,243 @@
++/*
++ * tempbuf_syscall.c
++ *
++ * High-Level Overview:
++ * ---------------------
++ * This custom system call named `tempbuf` maintains an in-kernel temporary
++ * storage of strings provided by user-space. Internally, it uses a global
++ * linked list (protected by a spinlock) to store multiple string entries.
++ *
++ * The syscall supports three operations, chosen via the `mode` argument:
++ *
++ *   mode = ADD    -> Copy a string from user-space and append it to the list.
++ *   mode = REMOVE -> Search for a matching string in the list and remove it.
++ *   mode = PRINT  -> Concatenate all stored strings and copy them back to user-space.
++ *
++ * Core Concepts Demonstrated:
++ * ----------------------------
++ * - Safe copying between user memory and kernel memory using copy_from_user()
++ *   and copy_to_user(). Direct dereferencing of __user pointers is illegal.
++ *
++ * - Dynamic memory allocation in kernel using kmalloc()/kfree() with GFP_KERNEL.
++ *
++ * - Use of Linux kernel's generic linked list implementation (list_head).
++ *
++ * - Concurrency protection using spinlock to avoid race conditions across CPUs.
++ *
++ * - Return values follow Linux syscall conventions:
++ *      0 / positive  -> success (bytes processed, etc.)
++ *     -EINVAL / -EFAULT / -ENOMEM / -ENOENT -> specific error codes
++ *
++ * Usage pattern from user-space (example):
++ * ----------------------------------------
++ *     // ADD
++ *     syscall(__NR_tempbuf, ADD, "hello", 5);
++ *
++ *     // PRINT
++ *     char buf[128];
++ *     syscall(__NR_tempbuf, PRINT, buf, sizeof(buf)); // buf now contains "hello ..."
++ *
++ *     // REMOVE
++ *     syscall(__NR_tempbuf, REMOVE, "hello", 5);
++ *
++ * This file is written in a teaching/report style with extensive commentary.
++ */
++
++#include <linux/kernel.h>     // for pr_info()
++#include <linux/syscalls.h>   // for SYSCALL_DEFINE macros
++#include <linux/uaccess.h>    // for copy_from_user(), copy_to_user()
++#include <linux/slab.h>       // for kmalloc(), kfree()
++#include <linux/list.h>       // for linked list support
++#include <linux/spinlock.h>   // for spinlock support
++
++// Mode selection for the sys_tempbuf syscall
++enum mode { PRINT = 0, ADD = 1, REMOVE = 2 };
++
++/*
++ * Each element stored in the in-kernel buffer is represented as a temp_node.
++ * - 'link' is used to attach this node to the global linked list.
++ * - 's' holds a dynamically allocated string copied from user space.
++ * - 'len' stores the string length.
++ */
++struct temp_node {
++    struct list_head link;
++    char *s;
++    size_t len;
++};
++
++/*
++ * Declare a global linked list head named temp_list.
++ * LIST_HEAD() initializes both next and prev pointers to itself,
++ * indicating an empty list initially.
++ */
++static LIST_HEAD(temp_list);
++
++/*
++ * Declare a global spinlock to protect concurrent access to temp_list.
++ * A spinlock is necessary because:
++ * - System calls may be invoked from different CPUs at the same time.
++ * - Linked list operations (insert/remove) are not atomic.
++ */
++static DEFINE_SPINLOCK(temp_lock);
++
++/*
++ * do_add_from_user:
++ * ------------------
++ * Copy a user-provided string into kernel memory and append it to temp_list.
++ */
++static int do_add_from_user(const void __user *data, size_t size)
++{
++    struct temp_node *node;
++    char *buf;
++
++    // Basic argument validation
++    if (!data || size == 0) return -EFAULT;
++
++    // Allocate kernel buffer (+1 for null terminator)
++    buf = kmalloc(size + 1, GFP_KERNEL);
++    if (!buf) return -ENOMEM;
++
++    // Safely copy from user space to kernel buffer
++    // Direct dereferencing of 'data' is forbidden since it is in __user address space.
++    if (copy_from_user(buf, data, size)) {
++        kfree(buf);
++        return -EFAULT;
++    }
++    buf[size] = '\0';  // Null-terminate to make it a valid C-string
++
++    // Allocate a new list node to store the string
++    node = kmalloc(sizeof(*node), GFP_KERNEL);
++    if (!node) {
++        kfree(buf);
++        return -ENOMEM;
++    }
++    node->s = buf;
++    node->len = size;
++
++    // Insert the node at the end of the list (tail insertion).
++    // A spinlock is used to avoid concurrent list modifications.
++    spin_lock(&temp_lock);
++    list_add_tail(&node->link, &temp_list);
++    spin_unlock(&temp_lock);
++
++    pr_info("[tempbuf] Added: %s\n", buf);
++    return 0;
++}
++
++/*
++ * do_remove_match_user:
++ * ----------------------
++ * Remove the first occurrence of a string in the list that matches
++ * the user-provided data exactly.
++ */
++static int do_remove_match_user(const void __user *data, size_t size)
++{
++    struct temp_node *pos, *n;
++    char *key;
++
++    if (!data || size == 0) return -EFAULT;
++
++    // Copy the target string to search for
++    key = kmalloc(size, GFP_KERNEL);
++    if (!key) return -ENOMEM;
++    if (copy_from_user(key, data, size)) {
++        kfree(key);
++        return -EFAULT;
++    }
++
++    // Traverse the list safely (list_for_each_entry_safe allows deletion while iterating)
++    spin_lock(&temp_lock);
++    list_for_each_entry_safe(pos, n, &temp_list, link) {
++        // Match length first for quick check, then compare contents
++        if (pos->len == size && !memcmp(pos->s, key, size)) {
++            list_del(&pos->link);  // unlink from list
++            spin_unlock(&temp_lock);  // release lock early to minimize contention
++
++            pr_info("[tempbuf] Removed: %.*s\n", (int)size, pos->s);
++
++            // Free resources for this node
++            kfree(pos->s);
++            kfree(pos);
++            kfree(key);
++            return 0;
++        }
++    }
++    spin_unlock(&temp_lock);
++
++    kfree(key);
++    return -ENOENT;  // Element not found
++}
++
++/*
++ * do_print_to_user:
++ * ------------------
++ * Concatenate all strings in temp_list into a user-provided buffer.
++ * Returns the number of bytes written (ssize_t allows negative values on error).
++ */
++static ssize_t do_print_to_user(void __user *ubuf, size_t usize)
++{
++    ssize_t written = 0;     // Number of characters written so far
++    size_t need_space = 0;   // Whether to insert a space before next item
++    struct temp_node *pos;
++    char *kbuf, *p;
++
++    if (!ubuf || usize == 0) return -EFAULT;
++
++    // Limit maximum output for safety
++    if (usize > 512) usize = 512;
++
++    // Zero-initialized allocation to avoid returning uninitialized data
++    kbuf = kzalloc(usize, GFP_KERNEL);
++    if (!kbuf) return -ENOMEM;
++    p = kbuf;
++
++    // Build the output string
++    spin_lock(&temp_lock);
++    list_for_each_entry(pos, &temp_list, link) {
++        size_t add = pos->len + (need_space ? 1 : 0);
++        if (written + add >= usize) break;  // Stop if buffer is full
++
++        if (need_space) {
++            *p++ = ' ';
++            written += 1;
++        }
++
++        memcpy(p, pos->s, pos->len);
++        p += pos->len;
++        written += pos->len;
++
++        need_space = 1;  // Ensure a space between subsequent entries
++    }
++    spin_unlock(&temp_lock);
++
++    pr_info("[tempbuf] %s\n", kbuf);
++
++    // Copy the result back to user space
++    if (copy_to_user(ubuf, kbuf, written)) {
++        kfree(kbuf);
++        return -EFAULT;
++    }
++
++    kfree(kbuf);
++    return written;  // Note: does not include null terminator
++}
++
++/*
++ * SYSCALL_DEFINE3 creates the actual entry point visible in the system call table.
++ * It automatically handles argument fetching and ensures correct calling convention.
++ *
++ * Arguments:
++ *   mode  - operation type (ADD / REMOVE / PRINT)
++ *   data  - user pointer (may be source or destination depending on mode)
++ *   size  - length of data
++ */
++SYSCALL_DEFINE3(tempbuf, int, mode, void __user *, data, size_t, size)
++{
++    switch (mode) {
++    case ADD:    return do_add_from_user(data, size);
++    case REMOVE: return do_remove_match_user(data, size);
++    case PRINT:  return do_print_to_user(data, size);
++    default:     return -EINVAL;  // Invalid mode input
++    }
++}
++
+-- 
+2.43.0
+
